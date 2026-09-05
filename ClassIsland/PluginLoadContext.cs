@@ -18,14 +18,29 @@ namespace ClassIsland;
 public class PluginLoadContext : AssemblyLoadContext
 {
     private readonly string _pluginDirectory;
-    private readonly AssemblyDependencyResolver _resolver;
+    private readonly AssemblyDependencyResolver? _resolver;
 
     public PluginLoadContext(PluginInfo info, string fullPath, bool suppressMacPluginLoader = false) 
         : base($"ClassIsland.PluginLoadContext[{info.Manifest.Id}]", isCollectible: true)
     {
         Info = info;
         _pluginDirectory = Path.GetDirectoryName(fullPath) ?? "";
-        _resolver = new AssemblyDependencyResolver(fullPath);
+        _resolver = TryCreateResolver(fullPath);
+    }
+
+    private static AssemblyDependencyResolver? TryCreateResolver(string fullPath)
+    {
+        try
+        {
+            return new AssemblyDependencyResolver(fullPath);
+        }
+        catch
+        {
+            // 在 macOS 原生打包（Microsoft.macOS.Sdk）运行时中，hostfxr/corehost_main 未被显式初始化，
+            // AssemblyDependencyResolver 会抛出 InvalidOperationException。
+            // 此时回退到自定义目录解析逻辑。
+            return null;
+        }
     }
 
     /// <summary>
@@ -125,11 +140,21 @@ public class PluginLoadContext : AssemblyLoadContext
             }
         }
 
-        // 4. 优先通过 .deps.json 标准依赖解析器解析
-        var assemblyPath = _resolver.ResolveAssemblyToPath(assemblyName);
-        if (assemblyPath != null && File.Exists(assemblyPath))
+        // 4. 优先通过 .deps.json 标准依赖解析器解析（若可用）
+        if (_resolver != null)
         {
-            return LoadFromAssemblyPath(assemblyPath);
+            try
+            {
+                var assemblyPath = _resolver.ResolveAssemblyToPath(assemblyName);
+                if (assemblyPath != null && File.Exists(assemblyPath))
+                {
+                    return LoadFromAssemblyPath(assemblyPath);
+                }
+            }
+            catch
+            {
+                // ignore
+            }
         }
 
         // 5. 回退到插件根目录搜索
@@ -139,6 +164,24 @@ public class PluginLoadContext : AssemblyLoadContext
             if (File.Exists(fallbackDll))
             {
                 return LoadFromAssemblyPath(fallbackDll);
+            }
+
+            // 搜索 runtimes 目录下的托管依赖
+            var os = OperatingSystem.IsMacOS() ? "osx" :
+                     OperatingSystem.IsLinux() ? "linux" :
+                     OperatingSystem.IsWindows() ? "win" : "";
+
+            var subPaths = new[]
+            {
+                Path.Combine(_pluginDirectory, "runtimes", os, "lib", "net8.0", assemblyName.Name + ".dll"),
+                Path.Combine(_pluginDirectory, "runtimes", "any", "lib", "net8.0", assemblyName.Name + ".dll"),
+            };
+            foreach (var sp in subPaths)
+            {
+                if (File.Exists(sp))
+                {
+                    return LoadFromAssemblyPath(sp);
+                }
             }
         }
 
@@ -150,11 +193,21 @@ public class PluginLoadContext : AssemblyLoadContext
     /// </summary>
     protected override IntPtr LoadUnmanagedDll(string unmanagedDllName)
     {
-        // 1. 尝试使用标准解析器
-        var libraryPath = _resolver.ResolveUnmanagedDllToPath(unmanagedDllName);
-        if (libraryPath != null && File.Exists(libraryPath))
+        // 1. 尝试使用标准解析器（若可用）
+        if (_resolver != null)
         {
-            return LoadUnmanagedDllFromPath(libraryPath);
+            try
+            {
+                var libraryPath = _resolver.ResolveUnmanagedDllToPath(unmanagedDllName);
+                if (libraryPath != null && File.Exists(libraryPath))
+                {
+                    return LoadUnmanagedDllFromPath(libraryPath);
+                }
+            }
+            catch
+            {
+                // ignore
+            }
         }
 
         // 2. 回退跨平台多路径搜索
