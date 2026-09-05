@@ -1,4 +1,4 @@
-﻿using System.Reflection;
+using System.Reflection;
 using System.Runtime.Loader;
 using System;
 using System.Collections.Generic;
@@ -13,19 +13,19 @@ namespace ClassIsland;
 
 /// <summary>
 /// 为插件加载提供隔离的 <see cref="AssemblyLoadContext"/> 实现。<para/>
-/// 根据运行平台选择不同的依赖解析器，并负责从插件目录解析托管与非托管依赖项。
-/// <remarks>macOS平台的依赖解析器为<see cref="MacPluginAssemblyResolver"/></remarks>
+/// 负责从插件依赖项解析托管与非托管依赖项，同时严格保证宿主共享程序集单例加载。
 /// </summary>
 public class PluginLoadContext : AssemblyLoadContext
 {
-    private readonly bool _suppressMacPluginLoader;
+    private readonly string _pluginDirectory;
+    private readonly AssemblyDependencyResolver _resolver;
 
-    public PluginLoadContext(PluginInfo info, string fullPath, bool suppressMacPluginLoader) : base($"ClassIsland.PluginLoadContext[{info.Manifest.Id}]")
+    public PluginLoadContext(PluginInfo info, string fullPath, bool suppressMacPluginLoader = false) 
+        : base($"ClassIsland.PluginLoadContext[{info.Manifest.Id}]", isCollectible: true)
     {
-        _suppressMacPluginLoader = suppressMacPluginLoader;
         Info = info;
-        CoreResolver = UseMacOsPluginLoadingBehavior ? null : new(fullPath);
-        MacResolver = UseMacOsPluginLoadingBehavior ? new(fullPath) : null;
+        _pluginDirectory = Path.GetDirectoryName(fullPath) ?? "";
+        _resolver = new AssemblyDependencyResolver(fullPath);
     }
 
     /// <summary>
@@ -33,31 +33,84 @@ public class PluginLoadContext : AssemblyLoadContext
     /// </summary>
     public PluginInfo Info { get; }
 
-    private bool UseMacOsPluginLoadingBehavior =>
-        _suppressMacPluginLoader || RuntimeInformation.IsOSPlatform(OSPlatform.OSX); 
-
-    private AssemblyDependencyResolver? CoreResolver { get; }
-    
-    private MacPluginAssemblyResolver? MacResolver { get; }
-
     private static IReadOnlyList<string> WinRTDeps { get; } = [
         "WinRT.Runtime",
         "Microsoft.Windows.SDK.NET"
     ];
 
+    private static readonly HashSet<string> HostAssemblyExactNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ClassIsland",
+        "ClassIsland.Core",
+        "ClassIsland.Shared",
+        "ClassIsland.Shared.IPC",
+        "ClassIsland.Platforms.Abstractions",
+        "ClassIsland.Platforms.Windows",
+        "ClassIsland.Platforms.Linux",
+        "ClassIsland.Platforms.MacOs",
+        "ClassIsland.Desktop",
+        "ClassIsland.Launcher",
+        "ClassIsland.PluginSdk"
+    };
+
+    private static readonly HashSet<string> HostAssemblyPrefixes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Avalonia",
+        "FluentAvalonia",
+        "CommunityToolkit.",
+        "Microsoft.",
+        "System.",
+        "System",
+        "netstandard",
+        "mscorlib",
+        "YamlDotNet",
+        "Newtonsoft.Json",
+        "Google.Protobuf",
+        "Sentry",
+        "Material.Icons"
+    };
+
+    private static bool IsHostAssembly(string? assemblyName)
+    {
+        if (string.IsNullOrEmpty(assemblyName))
+            return false;
+
+        // 1. 完全匹配已知宿主核心程序集
+        if (HostAssemblyExactNames.Contains(assemblyName))
+            return true;
+
+        // 2. 检查前缀或完全匹配基础框架程序集
+        foreach (var prefix in HostAssemblyPrefixes)
+        {
+            if (assemblyName.Equals(prefix, StringComparison.OrdinalIgnoreCase) ||
+                assemblyName.StartsWith(prefix + ".", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        // 3. 检查是否已经在默认主上下文加载
+        return Default.Assemblies.Any(a => string.Equals(a.GetName().Name, assemblyName, StringComparison.OrdinalIgnoreCase));
+    }
+
     /// <summary>
-    /// 在需要加载程序集时被调用。优先从已加载的插件依赖项上下文中解析，如果在插件目录中找到对应的程序集则从路径加载。
-    /// 对 WinRT 相关依赖会使用宿主的实现。
+    /// 在需要加载程序集时被调用。优先委托给宿主共享程序集，接着解析插件依赖项及插件目录程序集。
     /// </summary>
     protected override Assembly? Load(AssemblyName assemblyName)
     {
-        if (WinRTDeps.Contains(assemblyName.Name))
+        // 1. WinRT 依赖使用宿主实现
+        if (assemblyName.Name != null && WinRTDeps.Contains(assemblyName.Name))
         {
-            // 为了防止因引用 WinRT 依赖导致重复初始化 WinRT 相关运行时使应用代码无法正常调用 WinRT，
-            // 这里将插件要的加载的 WinRT 相关程序集替换为应用自带的 WinRT 相关程序集。
             return null;
         }
-        // 尝试查找依赖
+
+        // 2. 宿主核心与框架程序集直接委托给默认上下文，确保类型一致性
+        if (IsHostAssembly(assemblyName.Name))
+        {
+            return null;
+        }
+
+        // 3. 尝试从声明的依赖插件上下文查找
         foreach (var dep in Info.Manifest.Dependencies)
         {
             if (!PluginService.PluginLoadContexts.TryGetValue(dep.Id, out var context))
@@ -65,97 +118,109 @@ public class PluginLoadContext : AssemblyLoadContext
                 continue;
             }
 
-            var assembly = context.Load(assemblyName);
+            var assembly = context.LoadFromAssemblyName(assemblyName);
             if (assembly != null)
             {
                 return assembly;
             }
         }
-        
-        string? assemblyPath;
-        assemblyPath = UseMacOsPluginLoadingBehavior ? MacResolver?.ResolveAssemblyToPath(assemblyName) : CoreResolver?.ResolveAssemblyToPath(assemblyName);
-        
-        if (assemblyPath != null)
+
+        // 4. 优先通过 .deps.json 标准依赖解析器解析
+        var assemblyPath = _resolver.ResolveAssemblyToPath(assemblyName);
+        if (assemblyPath != null && File.Exists(assemblyPath))
         {
             return LoadFromAssemblyPath(assemblyPath);
         }
 
+        // 5. 回退到插件根目录搜索
+        if (!string.IsNullOrEmpty(_pluginDirectory) && !string.IsNullOrEmpty(assemblyName.Name))
+        {
+            var fallbackDll = Path.Combine(_pluginDirectory, assemblyName.Name + ".dll");
+            if (File.Exists(fallbackDll))
+            {
+                return LoadFromAssemblyPath(fallbackDll);
+            }
+        }
+
         return null;
     }
 
     /// <summary>
-    /// 解析并加载插件的非托管（本地）库，按平台和插件目录的约定搜索文件。
-    /// 返回非托管库句柄，找不到则返回 <see cref="IntPtr.Zero"/>。
+    /// 解析并加载插件的非托管（本地）库，支持跨平台约定与 runtimes 架构目录。
     /// </summary>
     protected override IntPtr LoadUnmanagedDll(string unmanagedDllName)
     {
-        string? libraryPath;
-        libraryPath = UseMacOsPluginLoadingBehavior ? MacResolver?.ResolveUnmanagedDllToPath(unmanagedDllName) : CoreResolver?.ResolveUnmanagedDllToPath(unmanagedDllName);
-
-        if (libraryPath != null)
+        // 1. 尝试使用标准解析器
+        var libraryPath = _resolver.ResolveUnmanagedDllToPath(unmanagedDllName);
+        if (libraryPath != null && File.Exists(libraryPath))
         {
             return LoadUnmanagedDllFromPath(libraryPath);
         }
 
+        // 2. 回退跨平台多路径搜索
+        var fallbackPath = ResolveUnmanagedDllFallback(unmanagedDllName);
+        if (fallbackPath != null && File.Exists(fallbackPath))
+        {
+            return LoadUnmanagedDllFromPath(fallbackPath);
+        }
+
         return IntPtr.Zero;
     }
-}
 
-/// <summary>
-/// macOS 专用的插件程序集与本地库解析器。根据插件目录结构查找真实文件路径。
-/// </summary>
-[SupportedOSPlatform("macos")]
-public class MacPluginAssemblyResolver(string componentAssemblyPath)
-{
-    private readonly string _pluginDirectory = Path.GetDirectoryName(componentAssemblyPath) ?? "";
-
-    /// <summary>
-    /// 将程序集名解析为插件目录下的 dll 文件路径（若存在），否则返回 null。
-    /// </summary>
-    public string? ResolveAssemblyToPath(AssemblyName assemblyName)
+    private string? ResolveUnmanagedDllFallback(string unmanagedDllName)
     {
-        var dllPath = Path.Combine(_pluginDirectory, assemblyName.Name + ".dll");
-        if (File.Exists(dllPath))
-            return dllPath;
-        return null;
-    }
+        if (string.IsNullOrEmpty(_pluginDirectory))
+            return null;
 
-    /// <summary>
-    /// 在插件目录及其可能的 runtimes 子目录中查找非托管库文件，并返回第一个匹配的完整路径。
-    /// 支持按处理器架构查找文件。
-    /// </summary>
-    public string? ResolveUnmanagedDllToPath(string unmanagedDllName)
-    {
-        var searchPaths = new List<string>
-        {
-            _pluginDirectory,
-            Path.Combine(_pluginDirectory, "runtimes", "osx", "native")
-        };
-        
+        var os = OperatingSystem.IsMacOS() ? "osx" :
+                 OperatingSystem.IsLinux() ? "linux" :
+                 OperatingSystem.IsWindows() ? "win" : "";
+
         var arch = RuntimeInformation.ProcessArchitecture switch
         {
             Architecture.X64 => "x64",
             Architecture.Arm64 => "arm64",
+            Architecture.Arm => "arm",
+            Architecture.X86 => "x86",
             _ => null
         };
-        
-        if (arch != null)
+
+        var searchPaths = new List<string>
         {
-            searchPaths.Add(Path.Combine(_pluginDirectory, "runtimes", $"osx-{arch}", "native"));
+            _pluginDirectory
+        };
+
+        if (!string.IsNullOrEmpty(os))
+        {
+            searchPaths.Add(Path.Combine(_pluginDirectory, "runtimes", os, "native"));
+            if (arch != null)
+            {
+                searchPaths.Add(Path.Combine(_pluginDirectory, "runtimes", $"{os}-{arch}", "native"));
+            }
         }
+
+        var extensions = OperatingSystem.IsMacOS() ? new[] { ".dylib", "" } :
+                         OperatingSystem.IsLinux() ? new[] { ".so", "" } :
+                         new[] { ".dll", "" };
 
         foreach (var path in searchPaths)
         {
             if (!Directory.Exists(path)) continue;
-            
-            var p1 = Path.Combine(path, $"lib{unmanagedDllName}.dylib");
-            if (File.Exists(p1)) return p1;
-            
-            var p2 = Path.Combine(path, $"{unmanagedDllName}.dylib");
-            if (File.Exists(p2)) return p2;
 
-            var p3 = Path.Combine(path, unmanagedDllName);
-            if (File.Exists(p3)) return p3;
+            foreach (var ext in extensions)
+            {
+                var candidates = new[]
+                {
+                    Path.Combine(path, $"lib{unmanagedDllName}{ext}"),
+                    Path.Combine(path, $"{unmanagedDllName}{ext}")
+                };
+
+                foreach (var candidate in candidates)
+                {
+                    if (File.Exists(candidate))
+                        return candidate;
+                }
+            }
         }
 
         return null;
