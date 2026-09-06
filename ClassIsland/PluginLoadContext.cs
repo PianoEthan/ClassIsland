@@ -125,63 +125,81 @@ public class PluginLoadContext : AssemblyLoadContext
             return null;
         }
 
-        // 3. 尝试从声明的依赖插件上下文查找
+        // 3. 依赖项与多层路径解析
+        return TryLoadFromDependencies(assemblyName)
+            ?? TryLoadFromResolver(assemblyName)
+            ?? TryLoadFromPluginDirectory(assemblyName);
+    }
+
+    private Assembly? TryLoadFromDependencies(AssemblyName assemblyName)
+    {
         foreach (var dep in Info.Manifest.Dependencies)
         {
-            if (!PluginService.PluginLoadContexts.TryGetValue(dep.Id, out var context))
+            if (PluginService.PluginLoadContexts.TryGetValue(dep.Id, out var context))
             {
-                continue;
-            }
-
-            var assembly = context.LoadFromAssemblyName(assemblyName);
-            if (assembly != null)
-            {
-                return assembly;
-            }
-        }
-
-        // 4. 优先通过 .deps.json 标准依赖解析器解析（若可用）
-        if (_resolver != null)
-        {
-            try
-            {
-                var assemblyPath = _resolver.ResolveAssemblyToPath(assemblyName);
-                if (assemblyPath != null && File.Exists(assemblyPath))
+                var assembly = context.LoadFromAssemblyName(assemblyName);
+                if (assembly != null)
                 {
-                    return LoadFromAssemblyPath(assemblyPath);
+                    return assembly;
                 }
             }
-            catch
-            {
-                // ignore
-            }
+        }
+        return null;
+    }
+
+    private Assembly? TryLoadFromResolver(AssemblyName assemblyName)
+    {
+        if (_resolver == null)
+        {
+            return null;
         }
 
-        // 5. 回退到插件根目录搜索
-        if (!string.IsNullOrEmpty(_pluginDirectory) && !string.IsNullOrEmpty(assemblyName.Name))
+        try
         {
-            var fallbackDll = Path.Combine(_pluginDirectory, assemblyName.Name + ".dll");
-            if (File.Exists(fallbackDll))
+            var assemblyPath = _resolver.ResolveAssemblyToPath(assemblyName);
+            if (!string.IsNullOrEmpty(assemblyPath) && File.Exists(assemblyPath))
             {
-                return LoadFromAssemblyPath(fallbackDll);
+                return LoadFromAssemblyPath(assemblyPath);
             }
+        }
+        catch
+        {
+            // ignore
+        }
 
-            // 搜索 runtimes 目录下的托管依赖
-            var os = OperatingSystem.IsMacOS() ? "osx" :
-                     OperatingSystem.IsLinux() ? "linux" :
-                     OperatingSystem.IsWindows() ? "win" : "";
+        return null;
+    }
 
-            var subPaths = new[]
+    private Assembly? TryLoadFromPluginDirectory(AssemblyName assemblyName)
+    {
+        if (string.IsNullOrEmpty(_pluginDirectory) || string.IsNullOrEmpty(assemblyName.Name))
+        {
+            return null;
+        }
+
+        var directDll = Path.Combine(_pluginDirectory, $"{assemblyName.Name}.dll");
+        if (File.Exists(directDll))
+        {
+            return LoadFromAssemblyPath(directDll);
+        }
+
+        return TryLoadFromRuntimeSubpaths(assemblyName.Name);
+    }
+
+    private Assembly? TryLoadFromRuntimeSubpaths(string assemblyName)
+    {
+        var os = GetOsName();
+        var candidates = new[]
+        {
+            Path.Combine(_pluginDirectory, "runtimes", os, "lib", "net8.0", $"{assemblyName}.dll"),
+            Path.Combine(_pluginDirectory, "runtimes", "any", "lib", "net8.0", $"{assemblyName}.dll")
+        };
+
+        foreach (var path in candidates)
+        {
+            if (File.Exists(path))
             {
-                Path.Combine(_pluginDirectory, "runtimes", os, "lib", "net8.0", assemblyName.Name + ".dll"),
-                Path.Combine(_pluginDirectory, "runtimes", "any", "lib", "net8.0", assemblyName.Name + ".dll"),
-            };
-            foreach (var sp in subPaths)
-            {
-                if (File.Exists(sp))
-                {
-                    return LoadFromAssemblyPath(sp);
-                }
+                return LoadFromAssemblyPath(path);
             }
         }
 
@@ -220,16 +238,17 @@ public class PluginLoadContext : AssemblyLoadContext
         return IntPtr.Zero;
     }
 
-    private string? ResolveUnmanagedDllFallback(string unmanagedDllName)
+    private static string GetOsName()
     {
-        if (string.IsNullOrEmpty(_pluginDirectory))
-            return null;
+        if (OperatingSystem.IsMacOS()) return "osx";
+        if (OperatingSystem.IsLinux()) return "linux";
+        if (OperatingSystem.IsWindows()) return "win";
+        return "";
+    }
 
-        var os = OperatingSystem.IsMacOS() ? "osx" :
-                 OperatingSystem.IsLinux() ? "linux" :
-                 OperatingSystem.IsWindows() ? "win" : "";
-
-        var arch = RuntimeInformation.ProcessArchitecture switch
+    private static string? GetArchitectureName()
+    {
+        return RuntimeInformation.ProcessArchitecture switch
         {
             Architecture.X64 => "x64",
             Architecture.Arm64 => "arm64",
@@ -237,41 +256,62 @@ public class PluginLoadContext : AssemblyLoadContext
             Architecture.X86 => "x86",
             _ => null
         };
+    }
 
-        var searchPaths = new List<string>
-        {
-            _pluginDirectory
-        };
+    private List<string> GetNativeSearchDirectories()
+    {
+        var paths = new List<string> { _pluginDirectory };
+        var os = GetOsName();
+        var arch = GetArchitectureName();
 
         if (!string.IsNullOrEmpty(os))
         {
-            searchPaths.Add(Path.Combine(_pluginDirectory, "runtimes", os, "native"));
+            paths.Add(Path.Combine(_pluginDirectory, "runtimes", os, "native"));
             if (arch != null)
             {
-                searchPaths.Add(Path.Combine(_pluginDirectory, "runtimes", $"{os}-{arch}", "native"));
+                paths.Add(Path.Combine(_pluginDirectory, "runtimes", $"{os}-{arch}", "native"));
             }
         }
 
+        return paths;
+    }
+
+    private static IEnumerable<string> GetCandidateLibraryFileNames(string name)
+    {
         var extensions = OperatingSystem.IsMacOS() ? new[] { ".dylib", "" } :
                          OperatingSystem.IsLinux() ? new[] { ".so", "" } :
                          new[] { ".dll", "" };
 
-        foreach (var path in searchPaths)
+        foreach (var ext in extensions)
         {
-            if (!Directory.Exists(path)) continue;
+            yield return $"lib{name}{ext}";
+            yield return $"{name}{ext}";
+        }
+    }
 
-            foreach (var ext in extensions)
+    private string? ResolveUnmanagedDllFallback(string unmanagedDllName)
+    {
+        if (string.IsNullOrEmpty(_pluginDirectory))
+        {
+            return null;
+        }
+
+        var searchDirs = GetNativeSearchDirectories();
+        var candidateNames = GetCandidateLibraryFileNames(unmanagedDllName).ToList();
+
+        foreach (var dir in searchDirs)
+        {
+            if (!Directory.Exists(dir))
             {
-                var candidates = new[]
-                {
-                    Path.Combine(path, $"lib{unmanagedDllName}{ext}"),
-                    Path.Combine(path, $"{unmanagedDllName}{ext}")
-                };
+                continue;
+            }
 
-                foreach (var candidate in candidates)
+            foreach (var filename in candidateNames)
+            {
+                var fullPath = Path.Combine(dir, filename);
+                if (File.Exists(fullPath))
                 {
-                    if (File.Exists(candidate))
-                        return candidate;
+                    return fullPath;
                 }
             }
         }
