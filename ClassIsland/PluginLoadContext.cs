@@ -137,10 +137,21 @@ public class PluginLoadContext : AssemblyLoadContext
         {
             if (PluginService.PluginLoadContexts.TryGetValue(dep.Id, out var context))
             {
-                var assembly = context.LoadFromAssemblyName(assemblyName);
-                if (assembly != null)
+                try
                 {
-                    return assembly;
+                    var assembly = context.LoadFromAssemblyName(assemblyName);
+                    if (assembly != null)
+                    {
+                        return assembly;
+                    }
+                }
+                catch (FileNotFoundException)
+                {
+                    // 依赖插件上下文中未找到该程序集，继续检查后续依赖或当前插件自身回退路径
+                }
+                catch (FileLoadException)
+                {
+                    // 忽略加载异常，允许后续回退继续探测
                 }
             }
         }
@@ -189,11 +200,18 @@ public class PluginLoadContext : AssemblyLoadContext
     private Assembly? TryLoadFromRuntimeSubpaths(string assemblyName)
     {
         var os = GetOsName();
-        var candidates = new[]
+        var arch = GetArchitectureName();
+        var candidates = new List<string>();
+
+        if (!string.IsNullOrEmpty(os))
         {
-            Path.Combine(_pluginDirectory, "runtimes", os, "lib", "net8.0", $"{assemblyName}.dll"),
-            Path.Combine(_pluginDirectory, "runtimes", "any", "lib", "net8.0", $"{assemblyName}.dll")
-        };
+            if (arch != null)
+            {
+                candidates.Add(Path.Combine(_pluginDirectory, "runtimes", $"{os}-{arch}", "lib", "net8.0", $"{assemblyName}.dll"));
+            }
+            candidates.Add(Path.Combine(_pluginDirectory, "runtimes", os, "lib", "net8.0", $"{assemblyName}.dll"));
+        }
+        candidates.Add(Path.Combine(_pluginDirectory, "runtimes", "any", "lib", "net8.0", $"{assemblyName}.dll"));
 
         foreach (var path in candidates)
         {
